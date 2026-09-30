@@ -231,6 +231,14 @@ func (a *App) Router() http.Handler {
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/start", a.startCup)
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/seal", a.sealCup)
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/remake", a.remakeCup)
+			r.With(require("store_manager", "barista")).Get("/staff/cups/{id}/remake-evaluation", a.remakeEvaluation)
+			r.With(require("store_manager", "barista")).Get("/staff/stores/{id}/stale-cups", a.listStaleCups)
+			r.With(require("store_manager", "barista")).Post("/staff/stores/{id}/remake-stale", a.autoRemakeStale)
+			r.With(require("store_manager", "barista", "area_manager", "supervisor")).Get("/staff/stores/{id}/remakes", a.listStoreRemakes)
+			r.With(require("store_manager", "barista")).Post("/staff/remakes/{id}/new-cup-label", a.printNewCupLabel)
+			r.Get("/remakes/{id}", a.getRemakeJob)
+			r.Get("/orders/{id}/remakes", a.listOrderRemakeJobs)
+			r.Get("/orders/{id}/compensations", a.listCompensations)
 			r.With(require("store_manager", "barista")).Post("/staff/orders/{id}/item-oos", a.itemOOS)
 			r.With(require("store_manager", "barista")).Get("/staff/orders/{id}/cup-labels", a.cupLabels)
 			r.With(require("store_manager", "barista")).Get("/staff/orders/{id}/bag-labels", a.bagLabels)
@@ -244,9 +252,26 @@ func (a *App) Router() http.Handler {
 			r.Get("/rider/arrivals/{id}", a.getArrival)
 			r.Get("/rider/screen", a.riderScreen)
 			r.With(require("rider", "store_manager", "barista")).Post("/rider/handoffs", a.handoff)
+			// 重做过程中骑手到店：wait_new / take_old / aborted 并发裁决
+			r.With(require("rider", "store_manager", "barista")).Post("/rider/remakes/{id}/decision", a.remakeDecision)
+
+			// 顾客端：延迟原因 + 重做进度 + 补偿方案（顾客/客服/门店/财务/区域均可查看）
+			r.Get("/customers/orders/{id}/status", a.customerOrderStatus)
 
 			// 顾客 / 客服
 			r.With(require("customer", "platform_cs", "finance")).Post("/customers/orders/{id}/complain", a.complain)
+
+			// 补偿：财务/店长确认方案；平台客服确认已兑现
+			r.With(require("finance", "store_manager")).Post("/finance/compensations/{id}/confirm", a.confirmCompensation)
+			r.With(require("platform_cs", "finance", "admin")).Post("/platform/compensations/{id}/fulfill", a.fulfillCompensation)
+
+			// 责任复核：店长申请，区域经理改判回算
+			r.With(require("store_manager", "area_manager", "supervisor")).
+				Post("/management/orders/{id}/responsibility-reviews", a.createResponsibilityReview)
+			r.With(require("area_manager", "supervisor", "admin")).
+				Post("/management/responsibility-reviews/{id}/adjudicate", a.adjudicateReview)
+			r.With(require("store_manager", "area_manager", "supervisor", "finance", "admin")).
+				Get("/management/responsibility-reviews", a.listResponsibilityReviews)
 
 			// 财务
 			r.With(require("finance", "store_manager")).Patch("/finance/exceptions/{id}", a.adjudicate)

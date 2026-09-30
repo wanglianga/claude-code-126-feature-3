@@ -10,6 +10,15 @@
 - 骑手到店核验：**订单号、袋数、冷热分袋、吸管、餐具**；未出杯禁止取走
 - 全场景异常：骑手提前到店、饮品放置过久重做、顾客备注漏看、错杯、轻食缺货、骑手取错袋、平台取消订单、顾客漏液投诉
 - **重做报损**：旧杯作废+报损成本，新杯重新入队，重做成本计入门店班组复盘与财务
+- **放置过久重做的并发交接与成本归属**：
+  - 按**饮品类型、冰热属性、放置时长、门店忙闲**计算品质窗口/安全窗口，支持单杯因子评估与一键自动重做
+  - 触发重做即原杯**报损失效（旧封签码立即作废、不可再交接）**，新杯生成**新封签码与新制作序号**
+  - 骑手恰在重做中到店：按**原杯是否在安全窗口 / 新杯贴是否已打印 / 顾客是否已取消**，系统裁决
+    `wait_new`（等新杯）/ `take_old`（放行原杯，回库新杯并冲回成本）/ `aborted`（取消终止），
+    订单级事务锁杜绝两杯同时被交接
+  - **原杯报损、骑手等待、门店时效、原料扣减、顾客补偿分别归因**；责任复核改判后只追加调整流水回算班组利润，不覆盖原始事件
+  - 店长可对**设备故障 / 平台派单延迟**申请责任复核，区域经理改判平台/共担承担
+  - 顾客端展示**延迟原因与补偿方案**，平台客服确认补偿**是否已兑现**（跨平台越权拒绝）
 - **缺货自动临时下架**（按原料反查商品），补货且原料齐备后自动恢复上架
 - 平台取消：未制作杯原料回库、已封杯报损、按门店/平台责任退款
 - 多平台订单**合并**（同一骑手顺路单一次到店登记、分别核验）
@@ -133,6 +142,42 @@ curl -s http://localhost:8080/v1/orders/1/events -H "X-Staff-Code: 0000"
 更多场景（重做、缺货下架、爆单、取消、合并、报表、班组评分、复盘）均在
 `scripts/e2e.sh` 中有可运行的完整演示，建议配合阅读。
 
+### 放置过久重做的并发交接（特性 3）
+
+```bash
+# 0) 接单、制作、封口（热美式）
+curl -s -X POST http://localhost:8080/v1/platform/orders -H "X-Staff-Code: 9001" \
+  -H "Content-Type: application/json" \
+  -d '{"platform_order_no":"EM-FEAT3-1","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}'
+# ……店员 start/seal（见上文），假设骑手迟迟未到、放置 26 分钟（品质 15 / 安全 25 分）
+
+# 1) 因子评估（饮品类型/冰热/放置时长/门店忙闲 → 动作与窗口）
+curl -s http://localhost:8080/v1/staff/cups/<cup_id>/remake-evaluation -H "X-Staff-Code: 3001"
+# 2) 一键自动重做（或 POST /v1/staff/cups/{id}/remake 手动）
+curl -s -X POST http://localhost:8080/v1/staff/stores/1/remake-stale -H "X-Staff-Code: 3001" \
+  -H "Content-Type: application/json" -d '{}'
+# 3) 骑手恰在重做中到店：系统按安全窗口/杯贴/取消裁决 wait_new|take_old|aborted
+curl -s -X POST http://localhost:8080/v1/rider/remakes/<job_id>/decision \
+  -H "X-Staff-Code: 4001" -H "Content-Type: application/json" -d '{}'
+# 4) 只能扫描新封签码交接（旧码立即报 old_seal_voided）
+curl -s -X POST http://localhost:8080/v1/rider/handoffs -H "X-Staff-Code: 4001" \
+  -H "Content-Type: application/json" \
+  -d '{"order_id":1,"seal_codes":["<new_seal>"],"actual_bags":1,"actual_hot":1}'
+# 5) 顾客端看延迟原因与补偿；财务确认；平台客服确认兑现
+curl -s http://localhost:8080/v1/customers/orders/1/status -H "X-Staff-Code: 7001"
+curl -s -X POST http://localhost:8080/v1/finance/compensations/<id>/confirm -H "X-Staff-Code: 6001" \
+  -H "Content-Type: application/json" -d '{"amount":7.5}'
+curl -s -X POST http://localhost:8080/v1/platform/compensations/<id>/fulfill -H "X-Staff-Code: 5001" \
+  -H "Content-Type: application/json" -d '{"note":"7.5元券已到账"}'
+# 6) 店长申请责任复核（设备故障/平台派单延迟），区域经理改判回算
+curl -s -X POST http://localhost:8080/v1/management/orders/1/responsibility-reviews -H "X-Staff-Code: 2001" \
+  -H "Content-Type: application/json" \
+  -d '{"ground":"platform_dispatch_delay","reason":"派单延迟26分钟","evidence":"骑手轨迹"}'
+curl -s -X POST http://localhost:8080/v1/management/responsibility-reviews/<id>/adjudicate \
+  -H "X-Staff-Code: 1001" -H "Content-Type: application/json" \
+  -d '{"approved":true,"new_responsibility":"platform","resolution":"平台承担"}'
+```
+
 ---
 
 ## 4. 本地开发（不使用 Docker）
@@ -162,8 +207,10 @@ psql -d postgres -c "DROP DATABASE coffee;" -c "CREATE DATABASE coffee;"
 - **Go 集成测试**：`go test ./...`
   会自动创建并使用独立的 `coffee_test` 数据库（默认连 `127.0.0.1:5433`、Redis `localhost:6380`，
   可用 `TEST_DATABASE_URL` / `TEST_REDIS_ADDR` 覆盖；连不上数据库时测试自动跳过）。
-  覆盖：接单扣库存、冷热分袋、提前到店、取错袋核验、爆单拒单、缺货自动下架、取消回库、重做报损、报表与班组评分、OpenAPI 合法性。
-- **端到端冒烟脚本（81 项断言）**：`scripts/e2e.sh`
+  覆盖：接单扣库存、冷热分袋、提前到店、取错袋核验、爆单拒单、缺货自动下架、取消回库、重做报损、报表与班组评分、OpenAPI 合法性，
+  以及特性 3 的**品质/安全窗口因子评估、自动重做、旧封签码立即失效、wait_new/take_old/aborted 三分支裁决、
+  报损冲回、取消终止、补偿跨平台兑现守卫、责任复核改判不覆盖原始事件**（共 16 个测试）。
+- **端到端冒烟脚本（136 项断言，23 个场景段）**：`scripts/e2e.sh`
   面向一个已运行在 `localhost:8099` 的服务（可用 `BASE=http://...` 改地址）。
   脚本默认会自动重置本地 `coffee` 库（`psql -h /tmp/cc126 -p 5433`）与 6380 Redis 并重启
   `/tmp/cc126/server`，如对接已运行环境请设 `SKIP_RESET=1`。
@@ -183,6 +230,10 @@ go build -o /tmp/cc126/server ./cmd/server
 | 基础数据 | `GET /v1/stores`、`GET /v1/menu`、`GET /v1/stores/{id}/inventory`、`GET /v1/stores/{id}/board` |
 | 平台接单 | `POST /v1/platform/orders`（支持 `Idempotency-Key`）、`POST /v1/platform/orders/{id}/cancel` |
 | 门店作业 | `GET /v1/staff/stores/{id}/queue`、`POST /v1/staff/stores/{id}/cups/next`、`POST /v1/staff/cups/{id}/start`、`POST /v1/staff/cups/{id}/seal`、`POST /v1/staff/cups/{id}/remake` |
+| 放置过久重做 | `GET /v1/staff/cups/{id}/remake-evaluation`、`GET /v1/staff/stores/{id}/stale-cups`、`POST /v1/staff/stores/{id}/remake-stale`、`GET /v1/staff/stores/{id}/remakes`、`GET /v1/remakes/{id}`、`GET /v1/orders/{id}/remakes`、`POST /v1/staff/remakes/{id}/new-cup-label` |
+| 重做并发交接 | `POST /v1/rider/remakes/{id}/decision`（wait_new/take_old/aborted）、交接时传 `seal_codes` 扫描新封签码 |
+| 顾客补偿 | `GET /v1/customers/orders/{id}/status`、`GET /v1/orders/{id}/compensations`、`POST /v1/finance/compensations/{id}/confirm`、`POST /v1/platform/compensations/{id}/fulfill` |
+| 责任复核 | `POST /v1/management/orders/{id}/responsibility-reviews`、`GET /v1/management/responsibility-reviews`、`POST /v1/management/responsibility-reviews/{id}/adjudicate` |
 | 缺货/下架 | `POST /v1/staff/orders/{id}/item-oos`、`POST /v1/staff/menu/{sku}/delist`、`GET /v1/stores/{id}/delistings`、`POST /v1/staff/inventory/restock` |
 | 打印 | `GET /v1/staff/orders/{id}/cup-labels`、`GET /v1/staff/orders/{id}/bag-labels` |
 | 爆单保护 | `POST /v1/staff/stores/{id}/surge` |
@@ -200,8 +251,19 @@ go build -o /tmp/cc126/server ./cmd/server
   后汇总扣减，不允许为负；任一原料不足整单回滚，并把相关商品**独立持久化临时下架**（不会因回滚丢失）。
 - **出杯顺序**：队列先取制作中的杯，再按骑手 ETA（缺省按接单+30 分钟）、接单时间、杯序号排序。
 - **分袋**：热饮→热袋、冰饮→冷袋、轻食→餐食袋；含饮品的组合套餐按其饮品冰热入袋。同温层首杯封签时扣减对应袋耗材。
-- **重做**：旧杯 `voided` 并报损（按配方成本），新杯继承原杯序号重新入队，`remake_no+1`；
-  重做成本写 `finance_records(kind=remake_cost, bearer=team)`，进入班组复盘。
+- **重做（放置过久）**：
+  - 因子判定：按饮品类型（冷萃最稳/果咖最不稳…）、冰热（冰饮耐放）、放置时长、门店忙闲（忙时窗口放宽 50%）
+    得出**品质窗口**（超过必须重做）与**安全窗口**（窗口内骑手到店仍可放行原杯）。
+  - 触发即**原杯报损**（`voided`、旧封签立即失效），新杯以**新制作序号**入队、封口生成新封签码，`remake_no+1`；
+    原杯报损（`loss`）、新杯原料（`remake_cost`）、顾客补偿（`customer_comp`）三类成本分开记账。
+  - 重做中骑手到店裁决 `POST /v1/rider/remakes/{id}/decision`：
+    新杯已封/新杯贴已打印 → 只能 `wait_new`；安全窗口内且未打杯贴 → `take_old`
+    （恢复旧杯、回库新杯、写 `loss_reversal`/`remake_reversal` 冲回、撤回补偿）；顾客已取消 → `aborted`。
+  - 骑手交接可传 `seal_codes` 逐杯扫码：旧码报 `old_seal_voided`、外单/重复/缺码拒绝，杜绝两杯同时交接。
+  - 责任复核：店长对设备故障/平台派单延迟申请，区域经理改判后写一条带 `review_id` 的 `platform_comp`
+    调整流水回算班组利润，异常原始责任存 `original_responsibility`，**原始事件与流水不覆盖**。
+- **顾客补偿**：重做时按原因生成方案（proposed）→ 财务确认（confirmed）→ 平台客服确认兑现（fulfilled，跨平台拒绝）；
+  `take_old` 或取消会撤回未兑现方案。顾客端 `GET /v1/customers/orders/{id}/status` 展示延迟原因、新杯进度与补偿。
 - **骑手等待责任**：交接时计算等待时长；骑手早于自身 ETA 到店的提前量不计门店责任，
   超过 ETA 仍等不到杯的部分记为门店出杯慢（`store_fault_wait_seconds`）。
 - **取消**：未做/制作中杯原料回库（`cancel_restock`），已封杯按报损处理；退款承担方由 `store_fault` 决定。
@@ -211,18 +273,24 @@ go build -o /tmp/cc126/server ./cmd/server
 
 ## 6. 已执行的验证结论
 
-以下验证在交付环境中实际执行通过（日期 2026-09-29）：
+以下验证在交付环境中实际执行通过（日期 2026-09-30）：
 
 1. `go vet ./...` 无告警；`go build ./cmd/server` 通过。
-2. `go test ./...` 通过：含 8 个集成测试用例（自动建 `coffee_test` 库）与 OpenAPI 3.0 规范合法性/路径覆盖测试。
-3. `scripts/e2e.sh` 端到端 **81/81 项断言全部通过**，覆盖 19 个场景段：
+2. `go test ./...` 通过：**15 个测试**（自动建 `coffee_test` 库），含原 9 个集成/OpenAPI 测试与
+   特性 3 的 6 个新测试——窗口因子评估、自动重做与旧码失效、take_old 报损冲回、取消终止、
+   责任复核改判（原始事件保留）、补偿兑现跨平台守卫。
+3. `scripts/e2e.sh` 端到端 **136/136 项断言全部通过**，覆盖 23 个场景段：
    健康检查、接单四杯生成、库存扣减（牛奶/封签/吸管/餐具数量逐一核对）、幂等重推、
    出杯队列与备注、四杯封签与 3 个冷热餐食分袋、杯贴袋贴、骑手提前到店与到店屏、
    未出杯拒交接、取错袋 409 与正确交接 200、漏吸管漏餐具识别、投诉受理与财务定责（含平台分摊）、
    过久重做报损与新杯回队、冷萃液缺货自动下架（`stock_shortage`→`item_delisted`）、
    补货后自动恢复上架、轻食接单后缺货单品退款下架、爆单手动暂停（`surge_paused`）与
    容量阈值（`surge_full`）、平台取消原料回库与退款归责、饿了么+美团多平台合并一次到店、
-   门店/区域报表、班组评分扣分、督导复盘含重做成本、订单时间线含 platform/barista/rider/customer/finance 五类角色。
+   门店/区域报表、班组评分扣分、督导复盘含重做成本、
+   **放置过久因子评估与一键自动重做、wait_new/旧码立即失效/新码交接、新杯贴不可逆分界、
+   顾客端延迟原因与补偿方案、财务确认与平台客服兑现（跨平台 403）、店长复核与区域经理改判回算（原始流水保留）、
+   安全窗口内 take_old 报损/重做双冲回与补偿撤回、重做中取消 aborted、报表与看板新口径**、
+   订单时间线含 platform/barista/rider/customer/finance 五类角色。
 4. Swagger UI（`/swagger/`）、`/openapi.yaml`、内嵌静态资源均返回 200；`/healthz` 返回 PG/Redis 均 ok。
 5. Dockerfile / docker-compose.yml 已提供，可 `docker compose up -d --build` 一键启动
    （交付沙箱无 Docker 守护进程，未在沙箱内实际构建；镜像构建仅依赖标准 `golang:1.22-alpine` 与 `alpine:3.19`，应用为 CGO_ENABLED=0 静态二进制）。
@@ -236,18 +304,22 @@ go build -o /tmp/cc126/server ./cmd/server
 ├── cmd/server/main.go          # 入口：读环境变量、连库、迁移、起 HTTP
 ├── internal/
 │   ├── db/                     # pgxpool 连接 + 内嵌 SQL 迁移执行器
-│   │   └── sql/                # 0001 建表 / 0002 种子数据（随二进制 embed）
+│   │   └── sql/                # 0001 建表 / 0002 种子 / 0003 重做并发交接（随二进制 embed）
 │   └── app/
 │       ├── server.go           # 路由、角色鉴权、登录
-│       ├── orders.go           # 接单、配方库存、幂等、缺货下架、平台取消
-│       ├── production.go       # 出杯队列、封签分袋、重做报损、轻食缺货、叫号
-│       ├── rider.go            # 骑手到店、到店屏、核验交接与等待归责
+│       ├── orders.go           # 接单、配方库存、幂等、缺货下架、平台取消（联动重做终止）
+│       ├── production.go       # 出杯队列、封签分袋、轻食缺货、叫号
+│       ├── remake.go           # 重做因子评估/自动重做、品质与安全窗口、报损+重做+补偿分别归因
+│       ├── remake_decision.go  # 重做中骑手到店 wait_new/take_old/aborted 裁决、新杯贴、回库冲回
+│       ├── compensation.go     # 顾客补偿方案、顾客端延迟视图、财务确认、平台客服兑现
+│       ├── review.go           # 店长责任复核、区域经理改判回算（不覆盖原始事件）
+│       ├── rider.go            # 骑手到店、到店屏、核验交接、封签码扫描（旧码立即失效）与等待归责
 │       ├── management.go       # 门店/库存/爆单/合并/杯贴袋贴/看板
 │       ├── reports.go          # 投诉、财务定责、台账、门店/区域报表、评分、复盘
 │       ├── models.go           # JSON 模型
 │       ├── swagger.go          # 内嵌 Swagger UI + OpenAPI
 │       └── web/                # openapi.yaml + swagger-ui-dist 静态资源
-├── scripts/e2e.sh              # 端到端冒烟脚本（80 断言）
+├── scripts/e2e.sh              # 端到端冒烟脚本（136 断言、23 场景段）
 ├── Dockerfile
 └── docker-compose.yml
 ```

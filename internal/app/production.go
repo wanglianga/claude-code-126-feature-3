@@ -311,6 +311,11 @@ func (a *App) sealCup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 订单级串行锁：封签是重做裁决（wait_new/take_old）的分叉状态，必须与裁决/交接/重做互斥
+	if err := lockOrderTx(ctx, tx, orderID); err != nil {
+		writeErr(w, err)
+		return
+	}
 	var status string
 	if err := tx.QueryRow(ctx, `SELECT status FROM order_cups WHERE id=$1`, cupID).Scan(&status); err != nil {
 		writeErr(w, err)
@@ -419,11 +424,8 @@ func bagSummary(ctx context.Context, tx pgx.Tx, orderID int64) map[string]any {
 }
 
 // ---------- 重做 / 报损 ----------
-
-type remakeReq struct {
-	Reason string         `json:"reason"` // stale_drink / wrong_cup / note_missed
-	Detail map[string]any `json:"detail"`
-}
+// 重做的完整状态机（因子评估、自动重做、报损/重做/补偿分别归因）见 remake.go；
+// 并发裁决（骑手在重做中到店）见 remake_decision.go。
 
 func openException(ctx context.Context, tx pgx.Tx, orderID int64, typ string) (int64, bool, error) {
 	var id int64
@@ -437,178 +439,6 @@ func openException(ctx context.Context, tx pgx.Tx, orderID int64, typ string) (i
 		return 0, false, err
 	}
 	return 0, false, nil
-}
-
-func (a *App) remakeCup(w http.ResponseWriter, r *http.Request) {
-	cupID := toInt64(chi.URLParam(r, "id"))
-	var req remakeReq
-	if err := decode(w, r, &req); err != nil {
-		writeErr(w, err)
-		return
-	}
-	switch req.Reason {
-	case "stale_drink", "wrong_cup", "note_missed":
-	default:
-		writeErr(w, errf(400, "bad_request", "reason 必须是 stale_drink/wrong_cup/note_missed"))
-		return
-	}
-	ac := actor(r)
-	ctx := r.Context()
-
-	tx, err := a.Pool.Begin(ctx)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	defer tx.Rollback(ctx)
-
-	var old orderCupFull
-	err = tx.QueryRow(ctx, `
-		SELECT c.id,c.order_id,o.store_id,c.menu_item_id,c.name_snapshot,c.unit_price,c.temp,c.sugar,
-		       c.cup_size,COALESCE(c.cup_note,''),c.seq,c.status,c.remake_no
-		FROM order_cups c JOIN orders o ON o.id=c.order_id WHERE c.id=$1 FOR UPDATE`, cupID).
-		Scan(&old.id, &old.orderID, &old.storeID, &old.menuItemID, &old.name, &old.price,
-			&old.temp, &old.sugar, &old.size, &old.note, &old.seq, &old.status, &old.remakeNo)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if old.status == "voided" {
-		writeErr(w, errf(409, "conflict", "该杯已作废，不能重做（请基于最新一杯重做）"))
-		return
-	}
-	var oStatus string
-	if err := tx.QueryRow(ctx, `SELECT status FROM orders WHERE id=$1`, old.orderID).Scan(&oStatus); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if oStatus == "canceled" || oStatus == "handed" {
-		writeErr(w, errf(409, "conflict", "订单已 %s，不能重做", oStatus))
-		return
-	}
-
-	recipes, err := loadRecipes(ctx, tx, []int64{old.menuItemID})
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	cost := cupCost(recipes[old.menuItemID], old.temp, old.size, old.sugar)
-
-	// 扣减新一杯的原料（重做成本）
-	var needs []stockNeed
-	for _, rr := range recipes[old.menuItemID] {
-		if q := cupRequirement(rr, old.temp, old.size, old.sugar); q > 0 {
-			needs = append(needs, stockNeed{IngID: rr.IngredientID, Delta: -q, Reason: "remake", OrderID: &old.orderID, StaffID: &ac.ID})
-		}
-	}
-	if err := applyStock(ctx, tx, old.storeID, needs); err != nil {
-		writeErr(w, err)
-		return
-	}
-
-	// 旧杯作废
-	if _, err := tx.Exec(ctx,
-		`UPDATE order_cups SET status='voided',voided_at=now(),void_reason=$2 WHERE id=$1`,
-		old.id, req.Reason); err != nil {
-		writeErr(w, err)
-		return
-	}
-	// 移除旧杯的待取袋映射
-	if _, err := tx.Exec(ctx, `DELETE FROM order_bags WHERE cup_id=$1`, old.id); err != nil {
-		writeErr(w, err)
-		return
-	}
-
-	// 新杯入队（重做号 +1，保持原出杯顺序）
-	var newID int64
-	if err := tx.QueryRow(ctx, `
-		INSERT INTO order_cups(order_id,menu_item_id,name_snapshot,unit_price,temp,sugar,cup_size,cup_note,
-			seq,status,remake_of_cup_id,remake_no)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued',$10,$11) RETURNING id`,
-		old.orderID, old.menuItemID, old.name, old.price, old.temp, old.sugar, old.size, old.note,
-		old.seq, old.id, old.remakeNo+1).Scan(&newID); err != nil {
-		writeErr(w, err)
-		return
-	}
-	// 订单回到制作中
-	if _, err := tx.Exec(ctx,
-		`UPDATE orders SET status='received',all_sealed_at=NULL WHERE id=$1 AND status='active'`, old.orderID); err != nil {
-		writeErr(w, err)
-		return
-	}
-
-	// 异常（复用同一类型的 open 异常）
-	excID, existed, err := openException(ctx, tx, old.orderID, req.Reason)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	if existed {
-		merged := map[string]any{"remake_history": req.Detail}
-		if _, err := tx.Exec(ctx,
-			`UPDATE exceptions SET occurrences=occurrences+1,cost_amount=cost_amount+$2,detail=detail||$3 WHERE id=$1`,
-			excID, cost, merged); err != nil {
-			writeErr(w, err)
-			return
-		}
-	} else {
-		detail := map[string]any{"old_cup_id": old.id, "new_cup_id": newID}
-		for k, v := range req.Detail {
-			detail[k] = v
-		}
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO exceptions(order_id,store_id,type,status,responsibility,detail,cost_amount,created_by)
-			VALUES($1,$2,$3,'open','store',$4,$5,$6) RETURNING id`,
-			old.orderID, old.storeID, req.Reason, detail, cost, ac.ID).Scan(&excID); err != nil {
-			writeErr(w, err)
-			return
-		}
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO loss_reports(store_id,order_id,cup_id,exception_id,reason,qty_cups,cost_amount,note,staff_id)
-		VALUES($1,$2,$3,$4,$5,1,$6,$7,$8)`,
-		old.storeID, old.orderID, old.id, excID, req.Reason, cost,
-		req.Reason+" 重做报损", ac.ID); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO finance_records(store_id,order_id,exception_id,kind,amount,bearer,note,created_by)
-		VALUES($1,$2,$3,'remake_cost',$4,'team',$5,$6)`,
-		old.storeID, old.orderID, excID, -cost, req.Reason+" 重做成本计入门店班组", ac.ID); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := a.logEvent(ctx, tx, old.orderID, "cup_remade", actorOf(ac), map[string]any{
-		"old_cup_id": old.id, "new_cup_id": newID, "reason": req.Reason, "cost": cost,
-	}); err != nil {
-		writeErr(w, err)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		writeErr(w, err)
-		return
-	}
-	cup, _ := a.loadCup(ctx, newID)
-	writeJSON(w, 201, map[string]any{
-		"new_cup": cup, "old_cup_id": old.id, "exception_id": excID, "loss_cost": cost,
-	})
-}
-
-type orderCupFull struct {
-	id         int64
-	orderID    int64
-	storeID    int64
-	menuItemID int64
-	name       string
-	price      float64
-	temp       string
-	sugar      string
-	size       string
-	note       string
-	seq        int
-	status     string
-	remakeNo   int
 }
 
 // ---------- 轻食缺货 ----------

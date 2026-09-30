@@ -666,6 +666,11 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 订单级串行锁：与重做/交接/裁决互斥
+	if err := lockOrderTx(ctx, tx, id); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if o.Status == "handed" || o.Status == "canceled" {
 		writeErr(w, errf(409, "conflict", "订单状态 %s 不可取消", o.Status))
 		return
@@ -740,6 +745,45 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	if err := applyStock(ctx, tx, o.StoreID, needs); err != nil {
 		writeErr(w, err)
 		return
+	}
+
+	// 终止进行中的重做任务（裁决=aborted），撤回尚未兑现的重做补偿方案；
+	// 新杯原料已由上面的取消回库统一处理，已封口新杯已计入报损。
+	jrows, jerr := tx.Query(ctx,
+		`SELECT id FROM remake_jobs WHERE order_id=$1 AND status='remaking' FOR UPDATE`, id)
+	if jerr != nil {
+		writeErr(w, jerr)
+		return
+	}
+	var openJobIDs []int64
+	for jrows.Next() {
+		var jid int64
+		_ = jrows.Scan(&jid)
+		openJobIDs = append(openJobIDs, jid)
+	}
+	jrows.Close()
+	for _, jid := range openJobIDs {
+		if _, err := tx.Exec(ctx, `
+			UPDATE remake_jobs SET status='canceled',decision='aborted',decided_at=now(),
+			  decision_detail=$2 WHERE id=$1`,
+			jid, map[string]any{"reason": "order_canceled", "by": actor(r).ID}); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE compensations SET status='withdrawn'
+		WHERE order_id=$1 AND status IN ('proposed','confirmed')`, id); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if len(openJobIDs) > 0 {
+		if err := a.logEvent(ctx, tx, id, "remake_aborted", actorOf(ac), map[string]any{
+			"remake_job_ids": openJobIDs, "reason": "order_canceled",
+		}); err != nil {
+			writeErr(w, err)
+			return
+		}
 	}
 
 	var excID int64

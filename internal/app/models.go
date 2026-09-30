@@ -120,3 +120,77 @@ type Exception struct {
 	ResolvedAt     *time.Time     `json:"resolved_at,omitempty"`
 	Resolution     string         `json:"resolution,omitempty"`
 }
+
+// RemakeJob 一次“放置过久重做”的并发交接状态机。
+type RemakeJob struct {
+	ID                int64          `json:"id"`
+	StoreID           int64          `json:"store_id"`
+	OrderID           int64          `json:"order_id"`
+	OldCupID          int64          `json:"old_cup_id"`
+	NewCupID          *int64         `json:"new_cup_id,omitempty"`
+	ExceptionID       *int64         `json:"exception_id,omitempty"`
+	Reason            string         `json:"reason"`
+	TriggerType       string         `json:"trigger_type"`
+	Status            string         `json:"status"` // remaking / old_taken / completed / canceled
+	Category          string         `json:"category"`
+	IsDrink           bool           `json:"is_drink"`
+	Temp              string         `json:"temp"`
+	IdleSeconds       int            `json:"idle_seconds"`
+	StoreBusy         bool           `json:"store_busy"`
+	QualityWindowSec  int            `json:"quality_window_seconds"`
+	SafetyWindowSec   int            `json:"safety_window_seconds"`
+	PolicyAction      string         `json:"policy_action"`
+	LossCost          float64        `json:"loss_cost"`
+	RemakeCost        float64        `json:"remake_cost"`
+	CompAmount        float64        `json:"comp_amount"`
+	NewLabelPrinted   bool           `json:"new_label_printed"`
+	NewLabelPrintedAt *time.Time     `json:"new_label_printed_at,omitempty"`
+	Decision          string         `json:"decision,omitempty"`
+	DecidedBy         *int64         `json:"decided_by,omitempty"`
+	DecidedAt         *time.Time     `json:"decided_at,omitempty"`
+	DecisionDetail    map[string]any `json:"decision_detail,omitempty"`
+	RiderWaitSeconds  int            `json:"rider_wait_seconds"`
+	CompletedAt       *time.Time     `json:"completed_at,omitempty"`
+	CreatedBy         *int64         `json:"created_by,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+// Compensation 顾客补偿方案与兑现（重做/设备故障/派单延迟）。
+type Compensation struct {
+	ID              int64      `json:"id"`
+	StoreID         int64      `json:"store_id"`
+	OrderID         int64      `json:"order_id"`
+	ExceptionID     *int64     `json:"exception_id,omitempty"`
+	RemakeJobID     *int64     `json:"remake_job_id,omitempty"`
+	Reason          string     `json:"reason"`
+	Status          string     `json:"status"` // proposed / confirmed / fulfilled / withdrawn / rejected
+	PlanAmount      float64    `json:"plan_amount"`
+	Bearer          string     `json:"bearer"`
+	CustomerMessage string     `json:"customer_message,omitempty"`
+	ProposedBy      *int64     `json:"proposed_by,omitempty"`
+	ProposedAt      time.Time  `json:"proposed_at"`
+	FulfilledBy     *int64     `json:"fulfilled_by,omitempty"`
+	FulfilledAt     *time.Time `json:"fulfilled_at,omitempty"`
+	FulfillNote     string     `json:"fulfill_note,omitempty"`
+}
+
+// ResponsibilityReview 店长对设备故障/平台派单延迟的责任复核与区域经理改判。
+type ResponsibilityReview struct {
+	ID                 int64      `json:"id"`
+	StoreID            int64      `json:"store_id"`
+	OrderID            int64      `json:"order_id"`
+	ExceptionID        *int64     `json:"exception_id,omitempty"`
+	RemakeJobID        *int64     `json:"remake_job_id,omitempty"`
+	Ground             string     `json:"ground"` // equipment_fault / platform_dispatch_delay
+	Reason             string     `json:"reason"`
+	Evidence           string     `json:"evidence,omitempty"`
+	Status             string     `json:"status"` // pending / approved / rejected
+	RequestedBy        int64      `json:"requested_by"`
+	RequestedAt        time.Time  `json:"requested_at"`
+	ReviewedBy         *int64     `json:"reviewed_by,omitempty"`
+	ReviewedAt         *time.Time `json:"reviewed_at,omitempty"`
+	Approved           *bool      `json:"approved,omitempty"`
+	NewResponsibility  string     `json:"new_responsibility,omitempty"`
+	ReattributedAmount float64    `json:"reattributed_amount"`
+	Resolution         string     `json:"resolution,omitempty"`
+}

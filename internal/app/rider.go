@@ -267,16 +267,17 @@ func (a *App) riderScreen(w http.ResponseWriter, r *http.Request) {
 // ---------- 核验交接 ----------
 
 type handoffReq struct {
-	OrderID         int64  `json:"order_id"`
-	PlatformOrderNo string `json:"platform_order_no"`
-	Platform        string `json:"platform"` // 店员代核验时指定平台
-	RiderName       string `json:"rider_name"`
-	ActualBags      *int   `json:"actual_bags"`
-	ActualHot       *int   `json:"actual_hot"`
-	ActualCold      *int   `json:"actual_cold"`
-	ActualFood      *int   `json:"actual_food"`
-	HasStraw        *bool  `json:"has_straw"`
-	HasUtensil      *bool  `json:"has_utensil"`
+	OrderID         int64    `json:"order_id"`
+	PlatformOrderNo string   `json:"platform_order_no"`
+	Platform        string   `json:"platform"` // 店员代核验时指定平台
+	RiderName       string   `json:"rider_name"`
+	SealCodes       []string `json:"seal_codes"` // 骑手逐杯扫描的封签码；重做后只有新码可通过
+	ActualBags      *int     `json:"actual_bags"`
+	ActualHot       *int     `json:"actual_hot"`
+	ActualCold      *int     `json:"actual_cold"`
+	ActualFood      *int     `json:"actual_food"`
+	HasStraw        *bool    `json:"has_straw"`
+	HasUtensil      *bool    `json:"has_utensil"`
 }
 
 func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
@@ -322,6 +323,11 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 订单级串行锁：与重做/取消/重做裁决互斥，杜绝两杯同时被交接
+	if err := lockOrderTx(ctx, tx, req.OrderID); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if req.PlatformOrderNo != "" && req.PlatformOrderNo != o.PlatformOrderNo {
 		writeErr(w, errf(409, "order_no_mismatch", "核验失败：平台单号与订单不一致"))
 		return
@@ -347,6 +353,58 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(409, "drinks_not_ready",
 			"饮品尚未全部出杯（%d/%d），骑手请等待，门店赶制中", sealedN, totalN))
 		return
+	}
+
+	// 封签码扫描核验：骑手只能扫当前有效（sealed）杯的封签码；
+	// 重做后旧杯 voided，旧码立即失效；码集合必须与本单有效封签杯完全一致，
+	// 任何旧码/重复码/外单码都会拒绝，杜绝两杯同时被交接。
+	if len(req.SealCodes) > 0 {
+		validCodes := map[string]int64{}
+		scRows, scErr := tx.Query(ctx,
+			`SELECT seal_code,id FROM order_cups WHERE order_id=$1 AND status='sealed' AND seal_code IS NOT NULL`,
+			req.OrderID)
+		if scErr != nil {
+			writeErr(w, scErr)
+			return
+		}
+		for scRows.Next() {
+			var code string
+			var cid int64
+			_ = scRows.Scan(&code, &cid)
+			validCodes[code] = cid
+		}
+		scRows.Close()
+		seen := map[string]bool{}
+		for _, code := range req.SealCodes {
+			if _, ok := validCodes[code]; !ok {
+				// 该码不属于本单当前有效杯：判定是否为已作废旧码
+				var oldCup int64
+				var oldStatus string
+				var remade bool
+				errf1 := tx.QueryRow(ctx, `
+					SELECT c.id,c.status,EXISTS(SELECT 1 FROM remake_jobs j
+					  WHERE j.old_cup_id=c.id AND j.status IN ('remaking','completed'))
+					FROM order_cups c WHERE c.seal_code=$1`, code).Scan(&oldCup, &oldStatus, &remade)
+				if errf1 == nil && (oldStatus == "voided" || remade) {
+					writeErr(w, errf(409, "old_seal_voided",
+						"封签码 %s 已随原杯重做作废，请扫描新杯封签码取走新杯", code))
+					return
+				}
+				writeErr(w, errf(409, "seal_code_invalid",
+					"封签码 %s 不属于本单当前待交接饮品，请核对", code))
+				return
+			}
+			if seen[code] {
+				writeErr(w, errf(409, "seal_code_duplicate", "封签码 %s 被重复扫描", code))
+				return
+			}
+			seen[code] = true
+		}
+		if len(seen) != len(validCodes) {
+			writeErr(w, errf(409, "seal_codes_incomplete",
+				"封签码数量与待交接杯数不符（扫描 %d，应 %d），请逐杯扫描后取餐", len(seen), len(validCodes)))
+			return
+		}
 	}
 
 	// 期望袋数 / 冷热分袋
@@ -612,6 +670,50 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+
+	// 关闭本单重做任务：新杯交接 → completed，并把重做额外等待计入门店时效；
+	// old_taken / canceled 已在裁决时终结，不在此处理。
+	var remakeWait int
+	jrows, jerr := tx.Query(ctx,
+		`SELECT id,created_at FROM remake_jobs WHERE order_id=$1 AND status='remaking' FOR UPDATE`,
+		req.OrderID)
+	if jerr != nil {
+		writeErr(w, jerr)
+		return
+	}
+	type jb struct {
+		id        int64
+		createdAt time.Time
+	}
+	var jobs []jb
+	for jrows.Next() {
+		var x jb
+		_ = jrows.Scan(&x.id, &x.createdAt)
+		jobs = append(jobs, x)
+	}
+	jrows.Close()
+	for _, j := range jobs {
+		rw := int(now.Sub(j.createdAt).Seconds())
+		if rw < 0 {
+			rw = 0
+		}
+		remakeWait += rw
+		if _, err := tx.Exec(ctx, `
+			UPDATE remake_jobs SET status='completed',completed_at=now(),
+			  rider_wait_seconds=$2,
+			  decision=COALESCE(NULLIF(decision,''),'wait_new')
+			WHERE id=$1`, j.id, rw); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := a.logEvent(ctx, tx, req.OrderID, "remake_completed", actorOf(ac), map[string]any{
+			"remake_job_id": j.id, "rider_wait_seconds": rw,
+			"seal_codes_scanned": req.SealCodes,
+		}); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, err)
 		return
@@ -620,6 +722,7 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		"passed": true, "order_id": req.OrderID, "status": "handed",
 		"bags": expBags, "hot": expHot, "cold": expCold, "food": expFood,
 		"rider_wait_seconds": waitSec, "store_fault_wait_seconds": storeWaitSec,
+		"remake_wait_seconds": remakeWait,
 	})
 }
 

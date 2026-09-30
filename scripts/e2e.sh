@@ -286,11 +286,135 @@ SCORE=$(J .score)
 [ "$SCORE" -lt 100 ] && ok "班组评分因异常扣分 (<100, 实际 $SCORE)" || bad "评分未扣分 $SCORE"
 api GET /v1/management/team-scores 1001 > /tmp/cc126/last.json
 [ "$(J 'length')" = "1" ] && ok "班组评分榜可查" || bad "评分榜"
-RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2026-09-29","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
+RC=$(api_code POST /v1/management/stores/1/reviews 1002 "{\"from\":\"2026-09-01\",\"to\":\"$(date +%F)\",\"summary\":\"午高峰出杯慢、漏餐具集中，加强封签核对\",\"actions\":[\"高峰加派1人\",\"出杯叫号培训\"]}")
 expect_code 201 "督导复盘创建"
 jq -e '.remake_cost_total < 0' /tmp/cc126/last.json >/dev/null && ok "重做成本计入复盘 ($(J .remake_cost_total))" || bad "复盘重做成本"
 
-echo "== 19. 时间线串联六类角色 =="
+echo "== 19. 放置过久：因子评估 + 自动重做 + 补偿方案 =="
+# 热美式一杯（空闲门店：品质窗口 15 分、安全窗口 25 分）
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-RM1","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}')
+expect_code 201 "重做链路单 RM1 接单"
+save rm1; ORM1=$(getf .id rm1); CRM1=$(api GET "/v1/orders/$ORM1" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CRM1/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$CRM1/seal" 3001 >/dev/null
+api GET "/v1/staff/cups/$CRM1/remake-evaluation" 3001 > /tmp/cc126/last.json
+[ "$(J '.policy.action')" = "monitor" ] && ok "刚封口判定 monitor" || bad "评估动作 $(J '.policy.action')"
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '10 min' WHERE id=$CRM1" >/dev/null
+RC=$(api_code POST /v1/staff/stores/1/remake-stale 3001 "{\"cup_ids\":[$CRM1]}")
+expect_code 200 "窗口内自动重做扫描"
+[ "$(J .triggered_count)" = "0" ] && ok "未达品质窗口不触发重做" || bad "误触发重做 $(cat /tmp/cc126/last.json)"
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '26 min' WHERE id=$CRM1" >/dev/null
+api GET "/v1/staff/cups/$CRM1/remake-evaluation" 3001 > /tmp/cc126/last.json
+[ "$(J '.policy.action')" = "remake" ] && ok "26 分超过品质窗口判定 remake" || bad "评估动作"
+RC=$(api_code POST /v1/staff/stores/1/remake-stale 3001 "{\"cup_ids\":[$CRM1]}")
+expect_code 200 "到期自动重做触发"
+[ "$(J .triggered_count)" = "1" ] && ok "触发 1 个重做任务" || bad "触发数"
+JRM1=$(J '.triggered[0].job.id'); NRM1=$(J '.triggered[0].new_cup_id')
+jq -e '.triggered[0].loss_cost>0' /tmp/cc126/last.json >/dev/null && ok "原杯报损成本单独归因" || bad "报损成本"
+[ "$(J '.triggered[0].comp_amount')" = "7.5" ] && ok "生成 50% 补偿方案 7.5 元" || bad "补偿金额 $(J '.triggered[0].comp_amount')"
+api GET "/v1/orders/$ORM1" 0000 > /tmp/cc126/last.json
+[ "$(J '.cups|map(select(.status=="queued"))[0].seq')" = "2" ] && ok "新杯生成新的制作序号 seq=2" || bad "新杯序号"
+OLDSEAL=$($PSQL -c "SELECT seal_code FROM order_cups WHERE id=$CRM1")
+api GET "/v1/orders/$ORM1/remakes" 0000 > /tmp/cc126/last.json
+[ "$(J '.[0].status')" = "remaking" ] && ok "重做任务 remaking" || bad "任务状态"
+
+echo "== 20. 重做中骑手到店：wait_new / 旧码失效 / 新码交接 =="
+RC=$(api_code POST "/v1/rider/remakes/$JRM1/decision" 4001 '{}')
+expect_code 200 "骑手到店系统裁决"
+[ "$(J .decision)" = "wait_new" ] && ok "超出安全窗口裁决 wait_new" || bad "裁决 $(J .decision)"
+[ "$(J '.job.new_label_printed')" = "false" ] && ok "尚未打印新杯贴" || bad "杯贴标志"
+RC=$(api_code POST "/v1/staff/remakes/$JRM1/new-cup-label" 3001)
+expect_code 200 "打印新杯贴"
+RC=$(api_code POST "/v1/rider/remakes/$JRM1/decision" 4001 '{"action":"take_old"}')
+expect_code 409 "打印杯贴后禁止回退取原杯"
+[ "$(J .error)" = "new_cup_committed" ] && ok "错误码 new_cup_committed" || bad "错误码 $(J .error)"
+api POST "/v1/staff/cups/$NRM1/start" 3001 >/dev/null
+api POST "/v1/staff/cups/$NRM1/seal" 3001 >/dev/null
+NEWSEAL=$($PSQL -c "SELECT seal_code FROM order_cups WHERE id=$NRM1")
+[ "$OLDSEAL" != "$NEWSEAL" ] && ok "新杯生成新封签码（与旧码不同）" || bad "封签码未更新"
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$ORM1,\"seal_codes\":[\"$OLDSEAL\"],\"actual_bags\":1}")
+expect_code 409 "旧封签码交接被拒"
+[ "$(J .error)" = "old_seal_voided" ] && ok "错误码 old_seal_voided（旧码立即失效）" || bad "错误码 $(J .error)"
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$ORM1,\"seal_codes\":[\"$NEWSEAL\"],\"actual_bags\":1,\"actual_hot\":1}")
+expect_code 200 "扫描新封签码交接成功"
+[ "$(J .status)" = "handed" ] && ok "订单 handed" || bad "状态"
+api GET "/v1/remakes/$JRM1" 0000 > /tmp/cc126/last.json
+[ "$(J .status)" = "completed" ] && [ "$(J .decision)" = "wait_new" ] && ok "重做任务 completed/wait_new" || bad "任务终态 $(cat /tmp/cc126/last.json|head -c 200)"
+
+echo "== 21. 顾客端延迟/补偿 + 财务确认 + 平台客服兑现 + 责任复核改判 =="
+CRM=$(api GET "/v1/orders/$ORM1/compensations" 0000 | jq -r '.[0].id')
+RC=$(api_code POST "/v1/finance/compensations/$CRM/confirm" 6001 '{"amount":7.5,"message":"确认补偿7.5元券"}')
+expect_code 200 "财务确认补偿方案"
+api GET "/v1/customers/orders/$ORM1/status" 7001 > /tmp/cc126/last.json
+[ "$(J '.compensations[0].plan_amount')" = "7.5" ] && ok "顾客端展示补偿方案 7.5 元" || bad "顾客端金额"
+[ "$(J '.compensations[0].message|length')" -gt 0 ] && ok "顾客端展示延迟原因与补偿文案" || bad "文案缺失"
+RC=$(api_code POST "/v1/platform/compensations/$CRM/fulfill" 5002 '{"note":"美团客服越权"}')
+expect_code 403 "跨平台客服兑现被拒"
+[ "$(J .error)" = "cross_platform" ] && ok "错误码 cross_platform" || bad "错误码"
+RC=$(api_code POST "/v1/platform/compensations/$CRM/fulfill" 5001 '{"note":"7.5元无门槛券已到账"}')
+expect_code 200 "饿了么客服确认补偿已兑现"
+[ "$(J .amount)" = "7.5" ] && ok "兑现金额 7.5 元" || bad "兑现金额 $(J .amount)"
+RC=$(api_code POST "/v1/platform/compensations/$CRM/fulfill" 5001 '{}')
+expect_code 409 "重复兑现被拒"
+# 店长责任复核 → 区域经理改判平台承担
+RC=$(api_code POST "/v1/management/orders/$ORM1/responsibility-reviews" 2001 "{\"ground\":\"platform_dispatch_delay\",\"remake_job_id\":$JRM1,\"reason\":\"平台派单延迟26分钟骑手才到店\",\"evidence\":\"骑手轨迹\"}")
+expect_code 201 "店长提交派单延迟责任复核"
+RRV=$(J .id)
+RC=$(api_code POST "/v1/management/responsibility-reviews/$RRV/adjudicate" 2001 '{"approved":true,"new_responsibility":"platform"}')
+expect_code 403 "店长无权改判"
+RC=$(api_code POST "/v1/management/responsibility-reviews/$RRV/adjudicate" 1001 '{"approved":true,"new_responsibility":"platform","resolution":"派单延迟证据充分，平台承担"}')
+expect_code 200 "区域经理改判平台承担"
+jq -e '.reattributed_amount>0' /tmp/cc126/last.json >/dev/null && ok "回算金额>0（$(J .reattributed_amount)）" || bad "回算金额"
+RC=$(api_code POST "/v1/management/responsibility-reviews/$RRV/adjudicate" 1001 '{"approved":false}')
+expect_code 409 "改判不可重复（原始事件保留）"
+api GET "/v1/stores/1/finance?from=2026-09-01&to=2030-12-31" 6001 > /tmp/cc126/last.json
+[ "$(J '[.summary[]|select(.kind=="platform_comp")]|length')" -ge 1 ] && ok "平台承担回算入财务台账" || bad "无 platform_comp"
+[ "$(J '[.records[]|select(.kind=="loss")]|length')" -ge 1 ] && ok "原始报损流水未被覆盖" || bad "原始流水丢失"
+
+echo "== 22. 安全窗口内到店取原杯 + 取消终止重做 =="
+# 冰拿铁：放置 10 分（安全窗口 30 分），手动重做后骑手到店 → take_old
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-RM2","store_id":1,"items":[{"sku":"LT","qty":1,"temp":"ice","sugar":"三分糖","cup_size":"L"}]}')
+expect_code 201 "RM2 接单"
+save rm2; ORM2=$(getf .id rm2); CRM2=$(api GET "/v1/orders/$ORM2" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CRM2/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CRM2/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '10 min' WHERE id=$CRM2" >/dev/null
+RC=$(api_code POST "/v1/staff/cups/$CRM2/remake" 3001 '{"reason":"stale_drink"}')
+expect_code 201 "安全窗口内手动重做受理"
+JRM2=$(J '.remake_job.id'); NRM2=$(J '.new_cup.id')
+RC=$(api_code POST "/v1/rider/remakes/$JRM2/decision" 4001 '{}')
+expect_code 200 "骑手到店自动裁决"
+[ "$(J .decision)" = "take_old" ] && ok "安全窗口内且未打杯贴 → take_old" || bad "裁决 $(J .decision)"
+api GET "/v1/remakes/$JRM2" 0000 > /tmp/cc126/last.json
+[ "$(J .status)" = "old_taken" ] && ok "任务 old_taken" || bad "任务状态"
+api GET "/v1/stores/1/finance?from=2026-09-01&to=2030-12-31" 6001 > /tmp/cc126/last.json
+[ "$(J '[.summary[]|select(.kind=="loss_reversal")]|length')" = "1" ] && ok "原杯报损冲回（loss_reversal）" || bad "无 loss_reversal"
+[ "$(J '[.summary[]|select(.kind=="remake_reversal")]|length')" = "1" ] && ok "新杯原料回库冲回（remake_reversal）" || bad "无 remake_reversal"
+[ "$($PSQL -c "SELECT status FROM compensations WHERE remake_job_id=$JRM2")" = "withdrawn" ] && ok "取原杯后补偿方案撤回" || bad "补偿未撤回"
+OLDSEAL2=$($PSQL -c "SELECT seal_code FROM order_cups WHERE id=$CRM2")
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$ORM2,\"seal_codes\":[\"$OLDSEAL2\"],\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true}")
+expect_code 200 "旧码恢复有效，原杯交接成功"
+# 重做中取消 → aborted
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-RM3","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}')
+expect_code 201 "RM3 接单"
+save rm3; ORM3=$(getf .id rm3); CRM3=$(api GET "/v1/orders/$ORM3" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CRM3/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CRM3/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '20 min' WHERE id=$CRM3" >/dev/null
+JRM3=$(api POST "/v1/staff/cups/$CRM3/remake" 3001 '{"reason":"stale_drink"}' | jq -r '.remake_job.id')
+RC=$(api_code POST "/v1/platform/orders/$ORM3/cancel" 5001 '{"reason":"顾客取消","store_fault":false}')
+expect_code 200 "重做中平台取消"
+api GET "/v1/remakes/$JRM3" 0000 > /tmp/cc126/last.json
+[ "$(J .status)" = "canceled" ] && [ "$(J .decision)" = "aborted" ] && ok "重做任务终止 canceled/aborted" || bad "任务状态"
+RC=$(api_code POST "/v1/rider/remakes/$JRM3/decision" 4001 '{}')
+expect_code 409 "终止后裁决被拒"
+# 报表新口径
+api GET "/v1/reports/stores/1/summary?from=2026-09-01&to=2030-12-31" 1001 > /tmp/cc126/last.json
+[ "$(J '.metrics.remakes')" -ge 4 ] && ok "报表统计重做任务（含自动+手动）" || bad "重做数 $(J '.metrics.remakes')"
+[ "$(J '.metrics.remake_take_old')" -ge 1 ] && ok "报表统计取原杯冲回次数" || bad "take_old 统计"
+[ "$(J '.metrics.platform_reattributed')" != "0" ] && ok "报表统计平台改判回算金额" || bad "回算统计"
+api GET /v1/stores/1/board 3001 > /tmp/cc126/last.json
+[ "$(J 'has("remaking_jobs")')" = "true" ] && ok "门店看板含重做中任务计数" || bad "看板字段"
+
+echo "== 23. 时间线串联六类角色 =="
 api GET "/v1/orders/$OID/events" 0000 > /tmp/cc126/last.json
 ROLES=$(J '[.[]|select(.actor_role!="")|.actor_role]|unique|join(",")')
 echo "  订单1出现的角色: $ROLES"

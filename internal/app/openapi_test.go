@@ -22,9 +22,17 @@ func TestOpenAPISpecIsValid(t *testing.T) {
 	expected := []string{
 		"/v1/platform/orders", "/v1/platform/orders/{id}/cancel",
 		"/v1/staff/cups/{id}/seal", "/v1/staff/cups/{id}/remake",
+		"/v1/staff/cups/{id}/remake-evaluation",
+		"/v1/staff/stores/{id}/remake-stale", "/v1/staff/stores/{id}/stale-cups",
+		"/v1/staff/remakes/{id}/new-cup-label", "/v1/remakes/{id}",
+		"/v1/rider/remakes/{id}/decision",
 		"/v1/rider/handoffs", "/v1/rider/arrivals", "/v1/rider/screen",
-		"/v1/customers/orders/{id}/complain", "/v1/finance/exceptions/{id}",
+		"/v1/customers/orders/{id}/complain", "/v1/customers/orders/{id}/status",
+		"/v1/platform/compensations/{id}/fulfill",
+		"/v1/finance/exceptions/{id}", "/v1/finance/compensations/{id}/confirm",
 		"/v1/reports/region", "/v1/management/stores/{id}/reviews",
+		"/v1/management/orders/{id}/responsibility-reviews",
+		"/v1/management/responsibility-reviews/{id}/adjudicate",
 		"/v1/staff/stores/{id}/surge", "/v1/staff/merge",
 	}
 	for _, p := range expected {

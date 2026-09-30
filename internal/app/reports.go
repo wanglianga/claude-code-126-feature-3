@@ -296,6 +296,10 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		WrongBags         int     `json:"wrong_bag_handoffs"`
 		Remakes           int     `json:"remakes"`
 		RemakeCost        float64 `json:"remake_cost"`
+		RemakeWaitSec     int     `json:"remake_rider_wait_seconds"`
+		RemakeTeamNetCost float64 `json:"remake_team_net_cost"`
+		PlatformReattr    float64 `json:"platform_reattributed"`
+		TakeOldReversals  int     `json:"remake_take_old"`
 		LeakComplaints    int     `json:"leak_complaints"`
 		FoodOOS           int     `json:"food_oos"`
 		NoteMissed        int     `json:"note_missed"`
@@ -336,6 +340,15 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		  (SELECT count(*) FROM loss_reports WHERE store_id=$1 AND reason IN ('wrong_cup','note_missed','stale_drink')
 		    AND created_at::date BETWEEN $2 AND $3),
 		  COALESCE((SELECT sum(amount) FROM fin WHERE kind='remake_cost'),0),
+		  COALESCE((SELECT sum(rider_wait_seconds) FROM remake_jobs
+		    WHERE store_id=$1 AND created_at::date BETWEEN $2 AND $3),0),
+		  COALESCE((SELECT COALESCE(sum(amount),0) FROM fin
+		    WHERE kind IN ('remake_cost','loss','loss_reversal','remake_reversal')
+		      OR (kind='customer_comp' AND bearer IN ('team','store'))
+		      OR (kind='platform_comp' AND review_id IS NOT NULL)),0),
+		  COALESCE((SELECT sum(amount) FROM fin WHERE kind='platform_comp' AND review_id IS NOT NULL),0),
+		  (SELECT count(*) FROM remake_jobs WHERE store_id=$1 AND status='old_taken'
+		    AND created_at::date BETWEEN $2 AND $3),
 		  (SELECT count(*) FROM exc WHERE type='leak_complaint'),
 		  (SELECT count(*) FROM exc WHERE type='food_oos'),
 		  (SELECT count(*) FROM exc WHERE type='note_missed'),
@@ -350,7 +363,8 @@ func (a *App) storeSummary(w http.ResponseWriter, r *http.Request) {
 		&m.OrdersReceived, &m.OrdersHanded, &m.OrdersCanceled, &m.StoreFaultCancel,
 		&m.AvgMakeSeconds, &m.P90MakeSeconds, &m.SlowOrders, &m.RiderWaitStoreSec,
 		&m.WrongCups, &m.MissingStraw, &m.MissingUtensil, &m.WrongBags, &m.Remakes,
-		&m.RemakeCost, &m.LeakComplaints, &m.FoodOOS, &m.NoteMissed, &m.Stale,
+		&m.RemakeCost, &m.RemakeWaitSec, &m.RemakeTeamNetCost, &m.PlatformReattr, &m.TakeOldReversals,
+		&m.LeakComplaints, &m.FoodOOS, &m.NoteMissed, &m.Stale,
 		&m.Revenue, &m.Refunds, &m.CustomerComp, &m.PlatformComp, &m.LossCost, &m.NetProfitImpact)
 	if err != nil {
 		writeErr(w, err)
@@ -489,7 +503,9 @@ func (a *App) refreshScore(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	_ = a.Pool.QueryRow(ctx,
 		`SELECT COALESCE(sum(amount),0)::float8 FROM finance_records
-		 WHERE store_id=$1 AND kind='remake_cost' AND period_date=$2`, storeID, day).Scan(&remakeCost)
+		 WHERE store_id=$1 AND period_date=$2
+		   AND (kind IN ('remake_cost','loss_reversal','remake_reversal')
+		        OR (kind='platform_comp' AND review_id IS NOT NULL))`, storeID, day).Scan(&remakeCost)
 
 	score, penalty := computeScore(counts)
 	metrics := map[string]any{
@@ -581,9 +597,11 @@ func (a *App) createReview(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var remakeTotal float64
-	if err := a.Pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(amount),0)::float8 FROM finance_records
-		 WHERE store_id=$1 AND kind='remake_cost' AND period_date BETWEEN $2 AND $3`,
+	if err := a.Pool.QueryRow(ctx, `
+		SELECT COALESCE(sum(amount),0)::float8 FROM finance_records
+		WHERE store_id=$1 AND period_date BETWEEN $2 AND $3
+		  AND (kind IN ('remake_cost','loss','loss_reversal','remake_reversal')
+		       OR (kind='platform_comp' AND review_id IS NOT NULL))`,
 		storeID, req.From, req.To).Scan(&remakeTotal); err != nil {
 		writeErr(w, err)
 		return

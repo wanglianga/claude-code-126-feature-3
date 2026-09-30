@@ -595,6 +595,7 @@ func (a *App) storeBoard(w http.ResponseWriter, r *http.Request) {
 		MakingOrders     int   `json:"making_orders"`
 		WaitingRiders    int   `json:"waiting_riders"`
 		StaleInPickup    int   `json:"stale_in_pickup"`
+		RemakingJobs     int   `json:"remaking_jobs"`
 		OpenExceptions   int   `json:"open_exceptions"`
 		ActiveDelistings int   `json:"active_delistings"`
 	}
@@ -613,12 +614,13 @@ func (a *App) storeBoard(w http.ResponseWriter, r *http.Request) {
 		     WHERE ra.store_id=s.id AND ra.handed_at IS NULL AND o.status<>'canceled'),
 		  (SELECT count(*) FROM orders WHERE store_id=s.id AND status='active'
 		     AND all_sealed_at IS NOT NULL AND all_sealed_at < now() - make_interval(mins => s.stale_minutes)),
+		  (SELECT count(*) FROM remake_jobs WHERE store_id=s.id AND status='remaking'),
 		  (SELECT count(*) FROM exceptions WHERE store_id=s.id AND status='open'),
 		  (SELECT count(*) FROM delistings WHERE store_id=s.id AND active=TRUE)
 		FROM stores s WHERE s.id=$1`, storeID).Scan(
 		&b.StoreID, &b.SurgeManual, &b.MaxActiveCups,
 		&b.ActiveCups, &b.QueuedCups, &b.MakingCups, &b.ReadyOrders, &b.MakingOrders,
-		&b.WaitingRiders, &b.StaleInPickup, &b.OpenExceptions, &b.ActiveDelistings); err != nil {
+		&b.WaitingRiders, &b.StaleInPickup, &b.RemakingJobs, &b.OpenExceptions, &b.ActiveDelistings); err != nil {
 		writeErr(w, err)
 		return
 	}
