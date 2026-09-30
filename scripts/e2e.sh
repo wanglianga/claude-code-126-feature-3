@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 端到端冒烟测试：覆盖接单→库存→出杯→封签分袋→骑手到店→核验交接→异常→财务→报表全链路
+# 端到端冒烟测试（128 项断言）：覆盖接单→库存→出杯→封签分袋→骑手到店→核验交接→异常→财务→报表，
+# 以及放置过久重做的并发交接（规则引擎/安全窗口/wait_new/take_original/abort/旧码失效/责任复核/补偿兑现）全链路
 set -uo pipefail
 BASE="${BASE:-http://localhost:8099}"
 CURL="curl -s --noproxy *"
@@ -176,10 +177,18 @@ api GET "/v1/orders/$OID3" 0000 > /tmp/cc126/last.json
 [ "$(J '.cups|map(select(.status=="queued"))|length')" = "1" ] && ok "新杯重新入队" || bad "新杯未入队"
 NEWCID=$(J '.cups|map(select(.status=="queued"))[0].id')
 api POST "/v1/staff/cups/$NEWCID/start" 3001 > /dev/null
-api POST "/v1/staff/cups/$NEWCID/seal" 3001 > /dev/null
+NEWSEAL=$(api POST "/v1/staff/cups/$NEWCID/seal" 3001 | jq -r '.cup.seal_code')
 api GET "/v1/staff/stores/1/loss-reports" 3001 > /tmp/cc126/last.json
 [ "$(J "[.[]|select(.reason==\"stale_drink\")]|length")" -ge 1 ] && ok "报损记录可查" || bad "无报损记录"
-api POST /v1/rider/handoffs 4001 "{\"order_id\":$OID3,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true}" > /dev/null
+# 旧封签码立即失效：不扫新码 / 扫旧码均被拒
+api GET "/v1/orders/$OID3" 0000 > /tmp/cc126/last.json
+OLDSEAL3=$(J '[.cups[]|select(.status=="loss_hold")][0].seal_code')
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OID3,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true}")
+[ "$RC" = "409" ] && [ "$(J .error)" = "must_scan_new_seal" ] && ok "重做后必须扫新封签码" || bad "新码强校验: $RC $(cat /tmp/cc126/last.json)"
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OID3,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true,\"seal_codes\":[\"$OLDSEAL3\"]}")
+[ "$RC" = "409" ] && [ "$(J .error)" = "old_seal_invalid" ] && ok "扫旧封签码被拒（旧码立即失效）" || bad "旧码失效: $RC $(cat /tmp/cc126/last.json)"
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OID3,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true,\"seal_codes\":[\"$NEWSEAL\"]}")
+expect_code 200 "扫新封签码完成交接"
 
 echo "== 12. 缺货自动临时下架（冷萃液 260ml，单杯需 300ml） =="
 $PSQL -c "UPDATE inventory SET qty=260 WHERE ingredient_id=(SELECT id FROM ingredients WHERE sku='coldbase') AND store_id=1" >/dev/null
@@ -286,7 +295,7 @@ SCORE=$(J .score)
 [ "$SCORE" -lt 100 ] && ok "班组评分因异常扣分 (<100, 实际 $SCORE)" || bad "评分未扣分 $SCORE"
 api GET /v1/management/team-scores 1001 > /tmp/cc126/last.json
 [ "$(J 'length')" = "1" ] && ok "班组评分榜可查" || bad "评分榜"
-RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2026-09-29","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
+RC=$(api_code POST /v1/management/stores/1/reviews 1002 '{"from":"2026-09-01","to":"2030-12-31","summary":"午高峰出杯慢、漏餐具集中，加强封签核对","actions":["高峰加派1人","出杯叫号培训"]}')
 expect_code 201 "督导复盘创建"
 jq -e '.remake_cost_total < 0' /tmp/cc126/last.json >/dev/null && ok "重做成本计入复盘 ($(J .remake_cost_total))" || bad "复盘重做成本"
 
@@ -296,6 +305,115 @@ ROLES=$(J '[.[]|select(.actor_role!="")|.actor_role]|unique|join(",")')
 echo "  订单1出现的角色: $ROLES"
 for role in platform barista rider customer finance; do
   echo "$ROLES" | grep -q "$role" && ok "时间线含 $role" || bad "时间线缺 $role"
+done
+
+echo "== 20. 过久重做并发交接：规则引擎 / wait_new / take_original / abort / 责任复核 / 补偿兑现 =="
+# 20.1 规则引擎（不重做）：热美式 15/20；冰冷萃 40/55；忙时果咖 25
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-S1","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"hot","sugar":"无糖","cup_size":"M"}]}')
+expect_code 201 "规则单1接单"; save s1; OS1=$(getf .id s1); CS1=$(api GET "/v1/orders/$OS1" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CS1/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CS1/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '16 min' WHERE id=$CS1" >/dev/null
+api GET "/v1/staff/cups/$CS1/stale-check" 3001 > /tmp/cc126/last.json
+[ "$(J .stale)" = "true" ] && [ "$(J .safe_minutes)" = "15" ] && [ "$(J .hard_safe_minutes)" = "20" ] && ok "热饮16分钟判定过久(15/20)" || bad "热饮规则: $(cat /tmp/cc126/last.json)"
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-S2","store_id":1,"items":[{"sku":"CB","qty":1,"temp":"ice","sugar":"无糖","cup_size":"L"}]}')
+expect_code 201 "规则单2接单"; save s2; OS2=$(getf .id s2); CS2=$(api GET "/v1/orders/$OS2" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CS2/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CS2/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '30 min' WHERE id=$CS2" >/dev/null
+api GET "/v1/staff/cups/$CS2/stale-check" 3001 > /tmp/cc126/last.json
+[ "$(J .stale)" = "false" ] && [ "$(J .safe_minutes)" = "40" ] && ok "冰冷萃30分钟未过久(阈值40)" || bad "冷萃规则"
+api GET "/v1/staff/cups/$CS2/stale-check?force_busy=1" 3001 > /tmp/cc126/last.json
+[ "$(J .busyness)" = "busy" ] && ok "门店忙闲因子可评估" || bad "忙闲因子"
+
+# 20.2 take_original：冰饮硬窗 35，26 分钟 + 未打新杯贴 → 骑手可取原杯，新杯作废回库，补偿作废
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-T1","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"ice","sugar":"无糖","cup_size":"L"}]}')
+expect_code 201 "取原杯单接单"; save t1; OT1=$(getf .id t1); CT1=$(api GET "/v1/orders/$OT1" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CT1/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CT1/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '26 min' WHERE id=$CT1" >/dev/null
+BEAN_T1=$($PSQL -c "SELECT qty FROM inventory WHERE store_id=1 AND ingredient_id=(SELECT id FROM ingredients WHERE sku='bean')")
+RC=$(api_code POST "/v1/staff/cups/$CT1/remake" 3001 '{"reason":"stale_drink","detail":{"waited_minutes":26}}')
+expect_code 201 "过久重做受理（含安全窗口）"
+RT1=$(J .remake_id); NT1=$($PSQL -c "SELECT new_cup_id FROM remakes WHERE id=$RT1")
+[ "$($PSQL -c "SELECT status FROM order_cups WHERE id=$CT1")" = "loss_hold" ] && ok "原杯 loss_hold 不可交接" || bad "原杯状态"
+api GET "/v1/rider/orders/$OT1/remake-decision" 4001 > /tmp/cc126/last.json
+[ "$(J '.remakes[0].recommended')" = "take_original" ] && [ "$(J '.remakes[0].original_in_safety_window')" = "true" ] && ok "推荐 take_original（硬窗内/未打杯贴）" || bad "决策推荐: $(cat /tmp/cc126/last.json)"
+RC=$(api_code POST "/v1/rider/orders/$OT1/remake-decision" 4001 "{\"remake_id\":$RT1,\"decision\":\"take_original\"}")
+expect_code 200 "骑手决策取原杯"
+[ "$($PSQL -c "SELECT status FROM order_cups WHERE id=$CT1")" = "sealed" ] && [ "$($PSQL -c "SELECT status FROM order_cups WHERE id=$NT1")" = "voided" ] && ok "原杯恢复可交接/新杯作废" || bad "取原杯杯状态"
+[ "$($PSQL -c "SELECT qty FROM inventory WHERE store_id=1 AND ingredient_id=(SELECT id FROM ingredients WHERE sku='bean')")" = "$BEAN_T1" ] && ok "放弃新杯后预扣原料回库（全程仅消耗原杯一杯）" || bad "取原杯回库"
+[ "$($PSQL -c "SELECT COALESCE(sum(amount),0) FROM finance_records WHERE order_id=$OT1 AND kind='remake_cost'")" = "0.00" ] && ok "取原杯后追加冲销，重做成本净额为 0（不覆盖原记录）" || bad "重做成本冲销"
+[ "$($PSQL -c "SELECT count(*) FROM compensations WHERE remake_id=$RT1 AND status='voided'")" = "1" ] && ok "取原杯后补偿方案作废" || bad "补偿作废"
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OT1,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true}")
+expect_code 200 "原杯正常交接完成"
+
+# 20.3 新杯贴打印后禁止取原杯
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-T2","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"ice","sugar":"无糖","cup_size":"L"}]}')
+expect_code 201 "杯贴因子单接单"; save t2; OT2=$(getf .id t2); CT2=$(api GET "/v1/orders/$OT2" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CT2/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CT2/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '26 min' WHERE id=$CT2" >/dev/null
+RT2=$(api POST "/v1/staff/cups/$CT2/remake" 3001 '{"reason":"stale_drink"}' | jq -r .remake_id)
+NT2=$($PSQL -c "SELECT new_cup_id FROM remakes WHERE id=$RT2")
+api POST "/v1/staff/cups/$NT2/label-print" 3001 > /tmp/cc126/last.json
+RC=$(api_code POST "/v1/rider/orders/$OT2/remake-decision" 4001 "{\"remake_id\":$RT2,\"decision\":\"take_original\"}")
+[ "$RC" = "409" ] && [ "$(J .error)" = "new_label_printed" ] && ok "新杯贴已打印禁止取原杯" || bad "杯贴因子: $RC"
+# 完成该单：做新杯扫新码交接
+api POST "/v1/staff/cups/$NT2/start" 3001 >/dev/null
+NT2SEAL=$(api POST "/v1/staff/cups/$NT2/seal" 3001 | jq -r '.cup.seal_code')
+RC=$(api_code POST /v1/rider/handoffs 4001 "{\"order_id\":$OT2,\"actual_bags\":1,\"actual_cold\":1,\"has_straw\":true,\"seal_codes\":[\"$NT2SEAL\"]}")
+expect_code 200 "等待新杯后扫新码交接"
+
+# 20.4 顾客取消终止重做：新杯回库、补偿作废、流程 aborted
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-T3","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"ice","sugar":"无糖","cup_size":"L"}]}')
+expect_code 201 "取消重做单接单"; save t3; OT3=$(getf .id t3); CT3=$(api GET "/v1/orders/$OT3" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CT3/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CT3/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '26 min' WHERE id=$CT3" >/dev/null
+RT3=$(api POST "/v1/staff/cups/$CT3/remake" 3001 '{"reason":"stale_drink"}' | jq -r .remake_id)
+RC=$(api_code POST "/v1/platform/orders/$OT3/cancel" 5001 '{"reason":"顾客取消","store_fault":false}')
+expect_code 200 "顾客取消"
+[ "$($PSQL -c "SELECT status FROM remakes WHERE id=$RT3")" = "aborted" ] && ok "重做随取消 aborted" || bad "重做终止"
+[ "$($PSQL -c "SELECT count(*) FROM compensations WHERE remake_id=$RT3 AND status='voided'")" = "1" ] && ok "补偿方案随取消作废" || bad "补偿随取消"
+RC=$(api_code POST "/v1/rider/orders/$OT3/remake-decision" 4001 "{\"remake_id\":$RT3,\"decision\":\"abort\"}")
+expect_code 200 "骑手确认终止重做"
+
+# 20.5 责任复核：店长申请平台派单延迟 → 区域经理改判 → 财务追加冲销/重挂（不覆盖原始）
+EXC_T2=$($PSQL -c "SELECT exception_id FROM remakes WHERE id=$RT2")
+RC=$(api_code POST "/v1/management/exceptions/$EXC_T2/responsibility-review" 2001 '{"request_type":"platform_dispatch_delay","reason":"平台派单延迟骑手迟迟未到","evidence":{"delay_min":40}}')
+expect_code 201 "店长申请责任复核"
+RVID=$(J .review_id)
+[ "$(J .original_responsibility)" = "store" ] && ok "记录原始责任 store" || bad "原始责任"
+RC=$(api_code POST "/v1/management/exceptions/$EXC_T2/responsibility-review" 2001 '{"request_type":"platform_dispatch_delay","reason":"重复申请"}')
+[ "$RC" = "409" ] && ok "重复复核被拒" || bad "重复复核 $RC"
+RC=$(api_code POST "/v1/management/responsibility-reviews/$RVID/decision" 2001 '{"approve":true,"new_responsibility":"platform"}')
+[ "$RC" = "403" ] && ok "店长无权改判(403)" || bad "改判权限 $RC"
+RC=$(api_code POST "/v1/management/responsibility-reviews/$RVID/decision" 1001 '{"approve":true,"new_responsibility":"platform","note":"派单延迟成立改判平台"}')
+expect_code 200 "区域经理改判平台"
+[ "$(J .new_responsibility)" = "platform" ] && [ "$(J .reallocated_finance_records)" -ge 2 ] && ok "追加冲销+重挂财务记录" || bad "财务追加: $(cat /tmp/cc126/last.json)"
+[ "$($PSQL -c "SELECT original_responsibility FROM responsibility_reviews WHERE id=$RVID")" = "store" ] && ok "原始责任不被覆盖" || bad "原始责任保留"
+TEAM_NET=$($PSQL -c "SELECT COALESCE(sum(amount),0) FROM finance_records WHERE exception_id=$EXC_T2 AND kind='remake_cost' AND bearer='team'")
+[ "$TEAM_NET" = "0.00" ] && ok "班组利润回算 team 净额=0" || bad "班组回算 $TEAM_NET"
+# 20.6 顾客端延迟原因/补偿 + 平台客服确认补偿兑现（承担方随改判=platform）
+api GET "/v1/customers/orders/$OT2/delay" 7001 > /tmp/cc126/last.json
+[ "$(J '.compensations|length')" -ge 1 ] && [ "$(J '.delay_reasons|length')" -ge 1 ] && ok "顾客端展示延迟原因与补偿方案" || bad "顾客端: $(cat /tmp/cc126/last.json)"
+COMP_T2=$($PSQL -c "SELECT id FROM compensations WHERE remake_id=$RT2 ORDER BY id LIMIT 1")
+RC=$(api_code POST "/v1/platform/compensations/$COMP_T2/fulfill" 5001 '{"note":"优惠券已到账"}')
+expect_code 200 "平台客服确认补偿兑现"
+[ "$(J .status)" = "fulfilled" ] && [ "$(J .bearer)" = "platform" ] && ok "补偿已兑现且承担方随改判为平台" || bad "兑现承担方: $(cat /tmp/cc126/last.json)"
+api GET "/v1/compensations?status=fulfilled" 5001 > /tmp/cc126/last.json
+[ "$(J "map(select(.compensation_id==$COMP_T2))|length")" = "1" ] && ok "补偿兑现队列可查" || bad "补偿队列"
+RC=$(api_code POST "/v1/platform/compensations/$COMP_T2/fulfill" 5001 '{"note":"重复"}')
+[ "$RC" = "409" ] && ok "补偿不可重复兑现" || bad "重复兑现 $RC"
+# 20.7 并发重做互斥（同一杯链仅一个进行中重做）
+RC=$(api_code POST /v1/platform/orders 9001 '{"platform_order_no":"EM-E2E-T4","store_id":1,"items":[{"sku":"AM","qty":1,"temp":"ice","sugar":"无糖","cup_size":"L"}]}')
+expect_code 201 "并发重做单接单"; save t4; OT4=$(getf .id t4); CT4=$(api GET "/v1/orders/$OT4" 0000 | jq -r '.cups[0].id')
+api POST "/v1/staff/cups/$CT4/start" 3001 >/dev/null; api POST "/v1/staff/cups/$CT4/seal" 3001 >/dev/null
+$PSQL -c "UPDATE order_cups SET sealed_at=now()-interval '26 min' WHERE id=$CT4" >/dev/null
+( curl -s --noproxy '*' -X POST "http://localhost:8099/v1/staff/cups/$CT4/remake" -H "X-Staff-Code: 3001" -H "Content-Type: application/json" -d '{"reason":"stale_drink"}' -o /tmp/cc126/pa.json &
+  curl -s --noproxy '*' -X POST "http://localhost:8099/v1/staff/cups/$CT4/remake" -H "X-Staff-Code: 3001" -H "Content-Type: application/json" -d '{"reason":"stale_drink"}' -o /tmp/cc126/pb.json & wait )
+[ "$(jq -r 'select(.remake_id!=null)|1' /tmp/cc126/pa.json /tmp/cc126/pb.json | wc -l)" = "1" ] && ok "并发重做仅一次成功" || bad "并发重做: $(cat /tmp/cc126/pa.json) / $(cat /tmp/cc126/pb.json)"
+[ "$($PSQL -c "SELECT count(*) FROM remakes WHERE order_id=$OT4 AND status IN ('in_progress','new_ready')")" = "1" ] && ok "同时仅一个进行中重做" || bad "重做唯一性"
+# 时间线含重做/决策/复核事件
+api GET "/v1/orders/$OT2/events" 0000 > /tmp/cc126/last.json
+for ev in cup_remade remake_new_ready remake_completed responsibility_review_requested responsibility_review_decided compensation_fulfilled; do
+  [ "$(J "[.[]|select(.event_type==\"$ev\")]|length")" -ge 1 ] && ok "时间线含 $ev" || bad "时间线缺 $ev"
 done
 
 echo

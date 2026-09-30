@@ -231,6 +231,9 @@ func (a *App) Router() http.Handler {
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/start", a.startCup)
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/seal", a.sealCup)
 			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/remake", a.remakeCup)
+			r.With(require("store_manager", "barista")).Post("/staff/cups/{id}/label-print", a.markCupLabelPrinted)
+			r.With(require("store_manager", "barista")).Get("/staff/cups/{id}/stale-check", a.cupStaleCheck)
+			r.With(require("store_manager", "barista")).Post("/staff/stores/{id}/stale-check", a.storeStaleCheck)
 			r.With(require("store_manager", "barista")).Post("/staff/orders/{id}/item-oos", a.itemOOS)
 			r.With(require("store_manager", "barista")).Get("/staff/orders/{id}/cup-labels", a.cupLabels)
 			r.With(require("store_manager", "barista")).Get("/staff/orders/{id}/bag-labels", a.bagLabels)
@@ -244,13 +247,24 @@ func (a *App) Router() http.Handler {
 			r.Get("/rider/arrivals/{id}", a.getArrival)
 			r.Get("/rider/screen", a.riderScreen)
 			r.With(require("rider", "store_manager", "barista")).Post("/rider/handoffs", a.handoff)
+			// 重做中骑手到店的交接决策（wait_new / take_original / abort）
+			r.Get("/rider/orders/{id}/remake-decision", a.remakeDecisionGet)
+			r.With(require("rider", "store_manager", "barista")).Post("/rider/orders/{id}/remake-decision", a.remakeDecisionPost)
 
 			// 顾客 / 客服
 			r.With(require("customer", "platform_cs", "finance")).Post("/customers/orders/{id}/complain", a.complain)
+			r.Get("/customers/orders/{id}/delay", a.customerDelay)
+			r.Get("/compensations", a.listCompensations)
+			r.With(require("platform_cs", "finance")).Post("/platform/compensations/{id}/fulfill", a.fulfillCompensation)
 
 			// 财务
 			r.With(require("finance", "store_manager")).Patch("/finance/exceptions/{id}", a.adjudicate)
 			r.Get("/stores/{id}/finance", a.storeFinance)
+
+			// 责任复核：店长申请 / 区域经理改判（追加不覆盖，回算班组利润）
+			r.With(require("store_manager", "area_manager", "admin")).Post("/management/exceptions/{id}/responsibility-review", a.requestResponsibilityReview)
+			r.With(require("area_manager", "admin")).Post("/management/responsibility-reviews/{id}/decision", a.decideResponsibilityReview)
+			r.Get("/management/responsibility-reviews", a.listResponsibilityReviews)
 
 			// 管理 / 报表
 			r.Get("/reports/stores/{id}/summary", a.storeSummary)

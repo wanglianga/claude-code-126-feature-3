@@ -102,7 +102,7 @@ func (a *App) riderArrive(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FILTER (WHERE status='sealed'),count(*) FILTER (WHERE status<>'voided')
+			`SELECT count(*) FILTER (WHERE status='sealed'),count(*) FILTER (WHERE status NOT IN ('voided','loss_hold'))
 			 FROM order_cups WHERE order_id=$1`, oid).Scan(&sealedN, &totalN); err != nil {
 			writeErr(w, err)
 			return
@@ -214,7 +214,7 @@ func (a *App) riderScreen(w http.ResponseWriter, r *http.Request) {
 		       COALESCE(ra.platform,''),ra.arrived_at,
 		       o.status,
 		       (SELECT count(*) FROM order_cups c WHERE c.order_id=o.id AND c.status='sealed'),
-		       (SELECT count(*) FROM order_cups c WHERE c.order_id=o.id AND c.status<>'voided'),
+		       (SELECT count(*) FROM order_cups c WHERE c.order_id=o.id AND c.status NOT IN ('voided','loss_hold')),
 		       EXTRACT(EPOCH FROM (now()-ra.arrived_at))::int
 		FROM rider_arrivals ra
 		JOIN stores s ON s.id=ra.store_id
@@ -267,16 +267,17 @@ func (a *App) riderScreen(w http.ResponseWriter, r *http.Request) {
 // ---------- 核验交接 ----------
 
 type handoffReq struct {
-	OrderID         int64  `json:"order_id"`
-	PlatformOrderNo string `json:"platform_order_no"`
-	Platform        string `json:"platform"` // 店员代核验时指定平台
-	RiderName       string `json:"rider_name"`
-	ActualBags      *int   `json:"actual_bags"`
-	ActualHot       *int   `json:"actual_hot"`
-	ActualCold      *int   `json:"actual_cold"`
-	ActualFood      *int   `json:"actual_food"`
-	HasStraw        *bool  `json:"has_straw"`
-	HasUtensil      *bool  `json:"has_utensil"`
+	OrderID         int64    `json:"order_id"`
+	PlatformOrderNo string   `json:"platform_order_no"`
+	Platform        string   `json:"platform"` // 店员代核验时指定平台
+	RiderName       string   `json:"rider_name"`
+	ActualBags      *int     `json:"actual_bags"`
+	ActualHot       *int     `json:"actual_hot"`
+	ActualCold      *int     `json:"actual_cold"`
+	ActualFood      *int     `json:"actual_food"`
+	HasStraw        *bool    `json:"has_straw"`
+	HasUtensil      *bool    `json:"has_utensil"`
+	SealCodes       []string `json:"seal_codes"` // 骑手扫描的封签码；重做后必须扫新码，旧码立即失效
 }
 
 func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
@@ -338,7 +339,7 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 	// 未出杯完成 → 不允许取走
 	var sealedN, totalN int
 	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FILTER (WHERE status='sealed'),count(*) FILTER (WHERE status<>'voided')
+		`SELECT count(*) FILTER (WHERE status='sealed'),count(*) FILTER (WHERE status NOT IN ('voided','loss_hold'))
 		 FROM order_cups WHERE order_id=$1`, req.OrderID).Scan(&sealedN, &totalN); err != nil {
 		writeErr(w, err)
 		return
@@ -346,6 +347,12 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 	if sealedN < totalN {
 		writeErr(w, errf(409, "drinks_not_ready",
 			"饮品尚未全部出杯（%d/%d），骑手请等待，门店赶制中", sealedN, totalN))
+		return
+	}
+
+	// 重做交接互斥：旧封签码立即失效，骑手必须扫描新杯封签码（杜绝两杯同时交接）
+	if err := a.verifyRemakeHandoff(ctx, tx, req.OrderID, req.SealCodes, ac); err != nil {
+		writeErr(w, err)
 		return
 	}
 
@@ -379,7 +386,7 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 	mrows, err := tx.Query(ctx,
 		`SELECT DISTINCT m.is_drink,m.includes_drink,c.temp
 		 FROM order_cups c JOIN menu_items m ON m.id=c.menu_item_id
-		 WHERE c.order_id=$1 AND c.status<>'voided'`, req.OrderID)
+		 WHERE c.order_id=$1 AND c.status NOT IN ('voided','loss_hold')`, req.OrderID)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -604,6 +611,10 @@ func (a *App) handoff(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err := a.completeRemakesOnHandoff(ctx, tx, req.OrderID, ac); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := a.logEvent(ctx, tx, req.OrderID, "order_handed", actorOf(ac), map[string]any{
 		"rider": riderName, "bags": expBags, "hot": expHot, "cold": expCold, "food": expFood,
 		"straw": hasStraw, "utensil": hasUtensil, "wait_seconds": waitSec,

@@ -235,7 +235,10 @@ paths:
   /v1/staff/cups/{id}/remake:
     post:
       tags: [store-ops]
-      summary: 重做（饮品放置过久/错杯/漏看备注），旧杯报损、新杯入队，成本计入班组
+      summary: >
+        重做（饮品放置过久/错杯/漏看备注）。两阶段工作流：原杯进入 loss_hold 报损留存且旧封签码立即失效、
+        扣新杯原料、新杯以新制作序号入队；自动生成顾客补偿方案；成本分别归因（报损/原料/财务/等待/补偿）。
+        并发安全：同一杯链同时只允许一个进行中的重做。
       parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
       requestBody:
         required: true
@@ -248,7 +251,39 @@ paths:
                 reason: {type: string, enum: [stale_drink, wrong_cup, note_missed]}
                 detail: {type: object, additionalProperties: true}
       responses:
-        '201': {description: 已生成重做杯}
+        '201': {description: 已生成重做杯（remake_id/factors/loss_cost）}
+        '409': {description: 订单已交接/取消、杯已报损、已有进行中重做}
+  /v1/staff/cups/{id}/stale-check:
+    get:
+      tags: [store-ops]
+      summary: 单杯放置过久评估（按 饮品类型×冰热×门店忙闲×放置时长，只读不产生副作用）
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer}}
+        - {name: force_busy, in: query, schema: {type: string, enum: ["0","1"]}, description: 强制按忙时阈值评估}
+      responses:
+        '200': {description: OK（stale/safe_minutes/hard_safe_minutes/busyness/elapsed_minutes 等因子）}
+  /v1/staff/stores/{id}/stale-check:
+    post:
+      tags: [store-ops]
+      summary: 扫描门店待取区所有已封杯，返回过久杯清单；auto_remake=true 时按规则自动触发重做
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                auto_remake: {type: boolean}
+                force_busy: {type: boolean}
+      responses:
+        '200': {description: OK（stale_cups / triggered_remakes）}
+  /v1/staff/cups/{id}/label-print:
+    post:
+      tags: [store-ops]
+      summary: 标记杯贴已打印（新杯贴打印是骑手到店交接决策的三因子之一）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
   /v1/staff/orders/{id}/item-oos:
     post:
       tags: [store-ops]
@@ -390,10 +425,16 @@ paths:
                 actual_food: {type: integer}
                 has_straw: {type: boolean}
                 has_utensil: {type: boolean}
+                seal_codes:
+                  type: array
+                  description: 骑手扫描的封签码。订单存在重做时必须扫新杯封签码；扫到旧码立即拒绝（old_seal_invalid）
+                  items: {type: string}
       responses:
         '200': {description: 核验通过已交接}
         '409':
-          description: 核验不通过/未出杯/已取消（issues 列出 wrong_bag/missing_straw/missing_utensil 等）
+          description: >
+            核验不通过/未出杯/已取消；重做相关错误码：old_seal_invalid(旧封签码已失效)、
+            must_scan_new_seal(必须扫新码)、remake_new_not_ready(新杯未完成)
           content:
             application/json:
               schema:
@@ -401,6 +442,39 @@ paths:
                 properties:
                   passed: {type: boolean}
                   issues: {type: array, items: {type: string}}
+  /v1/rider/orders/{id}/remake-decision:
+    get:
+      tags: [rider]
+      summary: >
+        重做进行中骑手到店的交接决策查询。三因子：原杯是否仍在硬安全窗口、新杯贴是否已打印、顾客是否已取消；
+        返回每个进行中重做的系统推荐 wait_new / take_original / abort 及因子明细。
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+    post:
+      tags: [rider]
+      summary: 执行交接决策（wait_new 继续等新杯 / take_original 取原杯 / abort 顾客取消终止），杜绝两杯同时交接
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                remake_id: {type: integer}
+                decision: {type: string, enum: [wait_new, take_original, abort]}
+      responses:
+        '200': {description: 决策已执行}
+        '409':
+          description: >
+            safety_window_expired(原杯超出硬安全窗口) / new_label_printed(新杯贴已打印) /
+            new_cup_ready(新杯已封签) / original_not_servable(错杯漏备注原杯不可交接) /
+            order_canceled / abort_requires_cancel
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /v1/customers/orders/{id}/complain:
     post:
       tags: [customer]
@@ -417,6 +491,37 @@ paths:
                 comp_amount: {type: number, description: 为空默认订单金额}
       responses:
         '201': {description: 已受理}
+  /v1/customers/orders/{id}/delay:
+    get:
+      tags: [customer]
+      summary: 顾客端展示延迟原因（重做状态/因子/等待）与补偿方案、骑手到店等待归因
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK（delay_reasons/arrivals/remakes/compensations）}
+  /v1/compensations:
+    get:
+      tags: [customer]
+      summary: 补偿方案队列（proposed/fulfilled/voided），平台客服与财务用；店长只看本门店
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [proposed, confirmed, fulfilled, voided]}}
+      responses:
+        '200': {description: OK}
+  /v1/platform/compensations/{id}/fulfill:
+    post:
+      tags: [customer]
+      summary: 平台客服确认补偿是否已兑现（承担方按异常当前定责，含复核改判后的责任）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount: {type: number, description: 为空按方案金额}
+                note: {type: string, example: 优惠券已发放到顾客账户}
+      responses:
+        '200': {description: 已确认兑现}
+        '409': {description: 已兑现/已作废}
   /v1/finance/exceptions/{id}:
     patch:
       tags: [finance]
@@ -509,6 +614,54 @@ paths:
                 actions: {type: array, items: {type: string}}
       responses:
         '201': {description: OK}
+  /v1/management/exceptions/{id}/responsibility-review:
+    post:
+      tags: [management]
+      summary: 店长对设备故障 / 平台派单延迟申请责任复核（不覆盖原始定责，只追加复核单）
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_type, reason]
+              properties:
+                request_type: {type: string, enum: [equipment_fault, platform_dispatch_delay]}
+                reason: {type: string}
+                evidence: {type: object, additionalProperties: true}
+      responses:
+        '201': {description: 复核申请已提交（status=requested）}
+        '409': {description: 已有待审批复核 review_pending}
+  /v1/management/responsibility-reviews:
+    get:
+      tags: [management]
+      summary: 责任复核单列表（可按 status 过滤）
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [requested, approved, rejected]}}
+      responses:
+        '200': {description: OK}
+  /v1/management/responsibility-reviews/{id}/decision:
+    post:
+      tags: [management]
+      summary: >
+        区域经理复核改判。批准后：异常责任更新为最新判定，原始责任与原始事件保留；
+        财务按原 period_date 追加“冲销+重挂”记录回算班组利润与补偿，绝不覆盖或删除原始记录。
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve]
+              properties:
+                approve: {type: boolean}
+                new_responsibility: {type: string, enum: [store, team, platform, shared]}
+                note: {type: string}
+      responses:
+        '200': {description: 已审批（reallocated_finance_records 为追加的冲销/重挂条数）}
+        '409': {description: 复核单已审批 review_closed}
 components:
   securitySchemes:
     StaffCode:

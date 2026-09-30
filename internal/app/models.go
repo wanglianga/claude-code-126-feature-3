@@ -42,28 +42,29 @@ type MenuItem struct {
 }
 
 type Cup struct {
-	ID            int64      `json:"id"`
-	OrderID       int64      `json:"order_id"`
-	MenuItemID    int64      `json:"menu_item_id"`
-	SKU           string     `json:"sku,omitempty"`
-	NameSnapshot  string     `json:"name_snapshot"`
-	UnitPrice     float64    `json:"unit_price"`
-	Temp          string     `json:"temp"`
-	Sugar         string     `json:"sugar"`
-	CupSize       string     `json:"cup_size"`
-	CupNote       string     `json:"cup_note,omitempty"`
-	Seq           int        `json:"seq"`
-	SealCode      string     `json:"seal_code,omitempty"`
-	Status        string     `json:"status"`
-	RemakeNo      int        `json:"remake_no"`
-	RemakeOfCupID *int64     `json:"remake_of_cup_id,omitempty"`
-	QueuedAt      time.Time  `json:"queued_at"`
-	StartedAt     *time.Time `json:"started_at,omitempty"`
-	SealedAt      *time.Time `json:"sealed_at,omitempty"`
-	VoidedAt      *time.Time `json:"voided_at,omitempty"`
-	VoidReason    string     `json:"void_reason,omitempty"`
-	StaffStartID  *int64     `json:"staff_start_id,omitempty"`
-	StaffSealID   *int64     `json:"staff_seal_id,omitempty"`
+	ID             int64      `json:"id"`
+	OrderID        int64      `json:"order_id"`
+	MenuItemID     int64      `json:"menu_item_id"`
+	SKU            string     `json:"sku,omitempty"`
+	NameSnapshot   string     `json:"name_snapshot"`
+	UnitPrice      float64    `json:"unit_price"`
+	Temp           string     `json:"temp"`
+	Sugar          string     `json:"sugar"`
+	CupSize        string     `json:"cup_size"`
+	CupNote        string     `json:"cup_note,omitempty"`
+	Seq            int        `json:"seq"`
+	SealCode       string     `json:"seal_code,omitempty"`
+	Status         string     `json:"status"`
+	RemakeNo       int        `json:"remake_no"`
+	RemakeOfCupID  *int64     `json:"remake_of_cup_id,omitempty"`
+	QueuedAt       time.Time  `json:"queued_at"`
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	SealedAt       *time.Time `json:"sealed_at,omitempty"`
+	VoidedAt       *time.Time `json:"voided_at,omitempty"`
+	VoidReason     string     `json:"void_reason,omitempty"`
+	LabelPrintedAt *time.Time `json:"label_printed_at,omitempty"`
+	StaffStartID   *int64     `json:"staff_start_id,omitempty"`
+	StaffSealID    *int64     `json:"staff_seal_id,omitempty"`
 }
 
 type Bag struct {

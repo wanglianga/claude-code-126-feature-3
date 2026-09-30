@@ -22,8 +22,16 @@ func TestOpenAPISpecIsValid(t *testing.T) {
 	expected := []string{
 		"/v1/platform/orders", "/v1/platform/orders/{id}/cancel",
 		"/v1/staff/cups/{id}/seal", "/v1/staff/cups/{id}/remake",
+		"/v1/staff/cups/{id}/stale-check", "/v1/staff/stores/{id}/stale-check",
+		"/v1/staff/cups/{id}/label-print",
 		"/v1/rider/handoffs", "/v1/rider/arrivals", "/v1/rider/screen",
-		"/v1/customers/orders/{id}/complain", "/v1/finance/exceptions/{id}",
+		"/v1/rider/orders/{id}/remake-decision",
+		"/v1/customers/orders/{id}/complain", "/v1/customers/orders/{id}/delay",
+		"/v1/compensations", "/v1/platform/compensations/{id}/fulfill",
+		"/v1/finance/exceptions/{id}",
+		"/v1/management/exceptions/{id}/responsibility-review",
+		"/v1/management/responsibility-reviews",
+		"/v1/management/responsibility-reviews/{id}/decision",
 		"/v1/reports/region", "/v1/management/stores/{id}/reviews",
 		"/v1/staff/stores/{id}/surge", "/v1/staff/merge",
 	}

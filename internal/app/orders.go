@@ -543,7 +543,7 @@ func (a *App) loadOrder(ctx context.Context, id int64) (*Order, error) {
 		`SELECT id,order_id,menu_item_id,COALESCE((SELECT sku FROM menu_items WHERE id=order_cups.menu_item_id),''),
 		name_snapshot,unit_price::float8,temp,sugar,cup_size,COALESCE(cup_note,''),seq,
 		COALESCE(seal_code,''),status,remake_no,remake_of_cup_id,queued_at,started_at,sealed_at,
-		voided_at,COALESCE(void_reason,''),staff_start_id,staff_seal_id
+		voided_at,COALESCE(void_reason,''),label_printed_at,staff_start_id,staff_seal_id
 		FROM order_cups WHERE order_id=$1 ORDER BY seq,id`, id)
 	if err != nil {
 		return nil, err
@@ -554,7 +554,7 @@ func (a *App) loadOrder(ctx context.Context, id int64) (*Order, error) {
 		if err := rows.Scan(&c.ID, &c.OrderID, &c.MenuItemID, &c.SKU, &c.NameSnapshot,
 			&c.UnitPrice, &c.Temp, &c.Sugar, &c.CupSize, &c.CupNote, &c.Seq,
 			&c.SealCode, &c.Status, &c.RemakeNo, &c.RemakeOfCupID, &c.QueuedAt,
-			&c.StartedAt, &c.SealedAt, &c.VoidedAt, &c.VoidReason, &c.StaffStartID, &c.StaffSealID); err != nil {
+			&c.StartedAt, &c.SealedAt, &c.VoidedAt, &c.VoidReason, &c.LabelPrintedAt, &c.StaffStartID, &c.StaffSealID); err != nil {
 			return nil, err
 		}
 		o.Cups = append(o.Cups, c)
@@ -718,7 +718,8 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	var lossCost float64
 	sealedCount := 0
 	for _, c := range cups {
-		if c.status == "voided" {
+		if c.status == "voided" || c.status == "loss_hold" {
+			// voided=已作废；loss_hold=重做原杯，报损与成本已在发起重做时入账，取消时不重复处理
 			continue
 		}
 		if _, err := tx.Exec(ctx,
@@ -738,6 +739,12 @@ func (a *App) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := applyStock(ctx, tx, o.StoreID, needs); err != nil {
+		writeErr(w, err)
+		return
+	}
+
+	// 终止进行中的重做工作流（新杯已由上面的统一循环回库/报损），作废未兑现补偿方案
+	if err := a.abortRemakesOnCancel(ctx, tx, id, actorOf(ac)); err != nil {
 		writeErr(w, err)
 		return
 	}
